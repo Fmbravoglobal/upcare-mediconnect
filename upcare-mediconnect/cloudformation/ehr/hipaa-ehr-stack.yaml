@@ -1,0 +1,562 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  UpCare MediConnect — HIPAA-Compliant EHR Infrastructure Stack
+  Deploys secure EHR storage, access logging, encryption, and audit controls.
+  Compliance: HIPAA | NIST SP 800-207 | SOC 2 | FedRAMP
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: upcare-mediconnect
+    Description: Project name used for resource naming
+
+  KMSKeyAdminArn:
+    Type: String
+    Description: ARN of the IAM role/user that administers the KMS key
+
+  AllowedAccountId:
+    Type: String
+    Description: AWS Account ID allowed to access EHR data
+
+  AlertEmail:
+    Type: String
+    Description: Email address for HIPAA security alerts
+    AllowedPattern: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+
+  RetentionDays:
+    Type: Number
+    Default: 2555  # 7 years — HIPAA minimum
+    Description: Log and data retention period in days
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters: [ProjectName, Environment]
+      - Label:
+          default: "Security Configuration"
+        Parameters: [KMSKeyAdminArn, AllowedAccountId]
+      - Label:
+          default: "Compliance Configuration"
+        Parameters: [AlertEmail, RetentionDays]
+
+# ─────────────────────────────────────────────
+Resources:
+# ─────────────────────────────────────────────
+
+  # ── KMS KEY — PHI ENCRYPTION ──────────────
+  PHIEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ProjectName}-${Environment} HIPAA PHI Encryption Key (BYOK)"
+      EnableKeyRotation: true          # HIPAA: Annual automatic rotation
+      MultiRegion: true                # DR capability
+      PendingWindowInDays: 30          # FedRAMP: 30-day deletion window
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: KeyAdminAccess
+            Effect: Allow
+            Principal:
+              AWS: !Ref KMSKeyAdminArn
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: "*"
+          - Sid: AllowS3Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: AllowCloudTrail
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: DenyNonSSLKeyUsage
+            Effect: Deny
+            Principal: "*"
+            Action: "kms:*"
+            Resource: "*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-phi-kms"
+        - Key: Compliance
+          Value: HIPAA-FedRAMP
+        - Key: DataClass
+          Value: PHI
+
+  PHIEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-${Environment}-phi"
+      TargetKeyId: !Ref PHIEncryptionKey
+
+  # ── S3 BUCKET — EHR PRIMARY STORAGE ──────
+  EHRDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-ehr-data-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt PHIEncryptionKey.Arn
+            BucketKeyEnabled: true      # Cost optimization with security
+      VersioningConfiguration:
+        Status: Enabled                 # HIPAA: Version all PHI objects
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: PHI-Tiering-Policy
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 365
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: !Ref RetentionDays
+          - Id: Abort-Incomplete-Uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .phi
+            Function: !GetAtt PHIAccessAuditLambda.Arn
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: "ehr-data-access/"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-ehr-data"
+        - Key: DataClass
+          Value: PHI
+        - Key: Compliance
+          Value: HIPAA
+
+  EHRDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EHRDataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt EHRDataBucket.Arn
+              - !Sub "${EHRDataBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+          - Sid: DenyNonKMSEncryptedUploads
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Sub "${EHRDataBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "s3:x-amz-server-side-encryption": "aws:kms"
+          - Sid: DenyPublicAccess
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+            Resource: !Sub "${EHRDataBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "aws:PrincipalAccount": !Ref AllowedAccountId
+          - Sid: AllowEHRServiceAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EHRServiceRole.Arn
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:ListBucket"
+            Resource:
+              - !GetAtt EHRDataBucket.Arn
+              - !Sub "${EHRDataBucket.Arn}/*"
+
+  # ── ACCESS LOG BUCKET ─────────────────────
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-access-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt PHIEncryptionKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: Log-Retention
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-access-logs"
+        - Key: Compliance
+          Value: HIPAA-SOC2
+
+  # ── CLOUDTRAIL — Audit Logging ────────────
+  EHRAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-${Environment}-ehr-audit-trail"
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true          # FedRAMP: multi-region coverage
+      EnableLogFileValidation: true     # HIPAA: detect log tampering
+      IncludeGlobalServiceEvents: true
+      KMSKeyId: !GetAtt PHIEncryptionKey.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: "AWS::S3::Object"
+              Values:
+                - !Sub "${EHRDataBucket.Arn}/"
+            - Type: "AWS::Lambda::Function"
+              Values: ["arn:aws:lambda"]
+      CloudWatchLogsLogGroupArn: !GetAtt AuditLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchRole.Arn
+      Tags:
+        - Key: Compliance
+          Value: HIPAA-SOC2-FedRAMP
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-cloudtrail-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt PHIEncryptionKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudTrailACLCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AllowCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub "${CloudTrailBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ── CLOUDWATCH LOG GROUP ──────────────────
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/${ProjectName}/${Environment}/ehr-audit-trail"
+      RetentionInDays: !Ref RetentionDays
+      KmsKeyId: !GetAtt PHIEncryptionKey.Arn
+
+  # ── SNS ALERTS ────────────────────────────
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-security-alerts"
+      KmsMasterKeyId: !Ref PHIEncryptionKey
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── IAM ROLES ────────────────────────────
+  EHRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-ehr-service-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                "aws:SecureTransport": "true"
+      ManagedPolicyArns:
+        - !Ref EHRServicePolicy
+      Tags:
+        - Key: Compliance
+          Value: HIPAA-NIST
+
+  EHRServicePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-${Environment}-ehr-service-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EHRBucketAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt EHRDataBucket.Arn
+              - !Sub "${EHRDataBucket.Arn}/*"
+          - Sid: KMSAccess
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !GetAtt PHIEncryptionKey.Arn
+          - Sid: SecretsManagerAccess
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/*"
+          - Sid: DenyAllElse
+            Effect: Deny
+            Action:
+              - iam:*
+              - organizations:*
+              - cloudtrail:Delete*
+              - cloudtrail:Stop*
+              - guardduty:Delete*
+            Resource: "*"
+
+  CloudTrailCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-cloudtrail-cw-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailCloudWatchPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AuditLogGroup.Arn
+
+  # ── LAMBDA — PHI ACCESS AUDIT ─────────────
+  PHIAccessAuditLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-phi-access-audit"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt PHIAuditLambdaRole.Arn
+      Timeout: 30
+      KmsKeyArn: !GetAtt PHIEncryptionKey.Arn
+      Environment:
+        Variables:
+          ALERT_TOPIC_ARN: !Ref SecurityAlertsTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def handler(event, context):
+              """HIPAA: Log and audit every PHI S3 object access event."""
+              topic_arn = os.environ['ALERT_TOPIC_ARN']
+              
+              for record in event.get('Records', []):
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  event_name = record['eventName']
+                  source_ip = record.get('requestParameters', {}).get('sourceIPAddress', 'unknown')
+                  
+                  # Log access
+                  print(json.dumps({
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'event': 'PHI_ACCESS',
+                      'bucket': bucket,
+                      'object_key': key,
+                      'event_type': event_name,
+                      'source_ip': source_ip,
+                      'compliance': 'HIPAA'
+                  }))
+                  
+                  # Alert on unusual patterns
+                  if 'Delete' in event_name:
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Subject='HIPAA ALERT: PHI Object Deletion Detected',
+                          Message=f'PHI object deleted: s3://{bucket}/{key}\nSource IP: {source_ip}\nTime: {datetime.utcnow().isoformat()}'
+                      )
+              
+              return {'statusCode': 200}
+      Tags:
+        - Key: Compliance
+          Value: HIPAA
+
+  PHIAuditLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PHIAuditPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PHIAccessAuditLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt EHRDataBucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+# ─────────────────────────────────────────────
+Outputs:
+# ─────────────────────────────────────────────
+
+  EHRBucketName:
+    Description: HIPAA-compliant EHR data bucket name
+    Value: !Ref EHRDataBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-EHRBucketName"
+
+  PHIEncryptionKeyArn:
+    Description: KMS key ARN for PHI encryption
+    Value: !GetAtt PHIEncryptionKey.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-PHIKeyArn"
+
+  CloudTrailArn:
+    Description: CloudTrail ARN for audit logging
+    Value: !GetAtt EHRAuditTrail.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-CloudTrailArn"
+
+  SecurityAlertsTopicArn:
+    Description: SNS topic ARN for security alerts
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-SecurityAlertsTopic"
+
+  EHRServiceRoleArn:
+    Description: IAM role ARN for EHR service access
+    Value: !GetAtt EHRServiceRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-EHRServiceRoleArn"

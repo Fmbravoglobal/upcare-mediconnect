@@ -1,0 +1,397 @@
+name: DevSecOps Security Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'   # Daily 6AM UTC compliance scan
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.7.0"
+  PYTHON_VERSION: "3.11"
+  AWS_REGION: us-east-1
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Secret Detection
+  # ─────────────────────────────────────────────
+  secret-detection:
+    name: 🔐 Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Terraform IaC Security Scan
+  # ─────────────────────────────────────────────
+  terraform-security:
+    name: 🏗️ Terraform Security Scan
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check -recursive terraform/
+          echo "✅ Terraform format check passed"
+
+      - name: Terraform Validate (AWS)
+        working-directory: terraform/aws
+        run: |
+          terraform init -backend=false
+          terraform validate
+          echo "✅ AWS Terraform validation passed"
+
+      - name: Terraform Validate (Azure)
+        working-directory: terraform/azure
+        run: |
+          terraform init -backend=false
+          terraform validate
+          echo "✅ Azure Terraform validation passed"
+
+      - name: Terraform Validate (GCP)
+        working-directory: terraform/gcp
+        run: |
+          terraform init -backend=false
+          terraform validate
+          echo "✅ GCP Terraform validation passed"
+
+      - name: Run Checkov (IaC Security)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-terraform.sarif
+          soft_fail: false
+          skip_check: >-
+            CKV_AWS_18,CKV_AWS_52
+        continue-on-error: false
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-terraform.sarif
+          category: checkov-terraform
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+          format: sarif
+          sarif_file: tfsec.sarif
+          soft_fail: false
+
+      - name: Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec.sarif
+          category: tfsec
+
+  # ─────────────────────────────────────────────
+  # JOB 3: CloudFormation Security Scan
+  # ─────────────────────────────────────────────
+  cloudformation-security:
+    name: ☁️ CloudFormation Security Scan
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install cfn-lint and cfn-nag
+        run: |
+          pip install cfn-lint
+          gem install cfn-nag
+
+      - name: Run cfn-lint
+        run: |
+          cfn-lint cloudformation/**/*.yaml \
+            --format sarif \
+            --output-file cfn-lint.sarif
+          echo "✅ cfn-lint scan complete"
+
+      - name: Upload cfn-lint SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: cfn-lint.sarif
+          category: cfn-lint
+
+      - name: Run cfn-nag
+        run: |
+          cfn_nag_scan \
+            --input-path cloudformation/ \
+            --output-format json \
+            > cfn-nag-results.json
+          echo "✅ cfn-nag scan complete"
+          cat cfn-nag-results.json
+
+      - name: Run Checkov (CloudFormation)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: cloudformation/
+          framework: cloudformation
+          output_format: sarif
+          output_file_path: checkov-cfn.sarif
+
+      - name: Upload Checkov CFN SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-cfn.sarif
+          category: checkov-cfn
+
+  # ─────────────────────────────────────────────
+  # JOB 4: SAST — Static Application Security Testing
+  # ─────────────────────────────────────────────
+  sast-scan:
+    name: 🔍 SAST — Code Security Analysis
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/terraform
+            p/secrets
+            p/owasp-top-ten
+            p/hipaa
+          generateSarif: "1"
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Run Bandit (Python Security)
+        run: |
+          pip install bandit
+          bandit -r compliance/ incident-response/lambda/ scripts/ \
+            -f json -o bandit-results.json || true
+          echo "✅ Bandit Python security scan complete"
+          cat bandit-results.json
+
+  # ─────────────────────────────────────────────
+  # JOB 5: Container & Image Scanning
+  # ─────────────────────────────────────────────
+  container-scan:
+    name: 🐳 Container Security Scan
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    if: hashFiles('**/Dockerfile') != ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  # ─────────────────────────────────────────────
+  # JOB 6: HIPAA & Compliance Validation
+  # ─────────────────────────────────────────────
+  compliance-validation:
+    name: 📋 HIPAA / NIST / SOC2 / FedRAMP Validation
+    runs-on: ubuntu-latest
+    needs: [terraform-security, cloudformation-security]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install compliance dependencies
+        run: |
+          pip install boto3 azure-identity google-cloud-securitycenter \
+            pyyaml jinja2 reportlab tabulate
+
+      - name: Run HIPAA Audit
+        run: |
+          python compliance/hipaa/hipaa-audit.py \
+            --output-format json \
+            --output-file hipaa-results.json \
+            --dry-run
+          echo "✅ HIPAA audit complete"
+
+      - name: Run NIST SP 800-207 Validator
+        run: |
+          python compliance/nist/nist-800-207-validator.py \
+            --output-format json \
+            --output-file nist-results.json \
+            --dry-run
+          echo "✅ NIST Zero Trust validation complete"
+
+      - name: Run SOC 2 Evidence Collector
+        run: |
+          python compliance/soc2/soc2-evidence-collector.py \
+            --dry-run \
+            --output-file soc2-results.json
+          echo "✅ SOC 2 evidence collection complete"
+
+      - name: Run FedRAMP ATO Checklist
+        run: |
+          python compliance/fedramp/fedramp-ato-checklist.py \
+            --dry-run \
+            --output-file fedramp-results.json
+          echo "✅ FedRAMP ATO checklist complete"
+
+      - name: Upload compliance artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-reports-${{ github.run_number }}
+          path: |
+            hipaa-results.json
+            nist-results.json
+            soc2-results.json
+            fedramp-results.json
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # JOB 7: SBOM Generation
+  # ─────────────────────────────────────────────
+  sbom-generation:
+    name: 📦 SBOM Generation
+    runs-on: ubuntu-latest
+    needs: secret-detection
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.run_number }}
+          path: sbom.cyclonedx.json
+          retention-days: 365
+
+  # ─────────────────────────────────────────────
+  # JOB 8: Security Gate — PR Comment & Block
+  # ─────────────────────────────────────────────
+  security-gate:
+    name: 🚦 Security Gate
+    runs-on: ubuntu-latest
+    needs:
+      - secret-detection
+      - terraform-security
+      - cloudformation-security
+      - sast-scan
+      - compliance-validation
+    if: always()
+    steps:
+      - name: Evaluate Security Gate
+        run: |
+          echo "=== Security Gate Evaluation ==="
+          SECRET_STATUS="${{ needs.secret-detection.result }}"
+          TF_STATUS="${{ needs.terraform-security.result }}"
+          CFN_STATUS="${{ needs.cloudformation-security.result }}"
+          SAST_STATUS="${{ needs.sast-scan.result }}"
+          COMPLIANCE_STATUS="${{ needs.compliance-validation.result }}"
+
+          FAILED=false
+          for STATUS in $SECRET_STATUS $TF_STATUS $CFN_STATUS $SAST_STATUS $COMPLIANCE_STATUS; do
+            if [ "$STATUS" = "failure" ]; then
+              FAILED=true
+            fi
+          done
+
+          if [ "$FAILED" = "true" ]; then
+            echo "❌ SECURITY GATE FAILED — One or more security checks failed."
+            echo "🚫 Deployment blocked. Review findings in the Security tab."
+            exit 1
+          else
+            echo "✅ ALL SECURITY CHECKS PASSED"
+            echo "🟢 Security gate cleared. Safe to merge."
+          fi
+
+      - name: Post PR summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = {
+              'Secret Detection':      '${{ needs.secret-detection.result }}',
+              'Terraform Security':    '${{ needs.terraform-security.result }}',
+              'CloudFormation Scan':   '${{ needs.cloudformation-security.result }}',
+              'SAST Analysis':         '${{ needs.sast-scan.result }}',
+              'Compliance Validation': '${{ needs.compliance-validation.result }}'
+            };
+            const icon = r => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+            const rows = Object.entries(jobs)
+              .map(([k, v]) => `| ${k} | ${icon(v)} ${v} |`)
+              .join('\n');
+            const body = `## 🔒 DevSecOps Security Gate Report\n\n| Check | Status |\n|---|---|\n${rows}\n\n> Generated by UpCare MediConnect Security Pipeline`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

@@ -1,0 +1,62 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EHRReadOnlyS3",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:GetObjectTagging",
+        "s3:ListBucket",
+        "s3:ListBucketVersions"
+      ],
+      "Resource": [
+        "arn:aws:s3:::upcare-prod-ehr-data-*",
+        "arn:aws:s3:::upcare-prod-ehr-data-*/*"
+      ],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true",
+          "aws:MultiFactorAuthPresent": "true"
+        },
+        "NumericLessThan": {
+          "aws:MultiFactorAuthAge": "3600"
+        }
+      }
+    },
+    {
+      "Sid": "KMSDecryptPHI",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:us-east-1:*:key/*",
+      "Condition": {
+        "StringLike": {
+          "kms:ViaService": "s3.*.amazonaws.com"
+        },
+        "StringEquals": {
+          "kms:RequestAlias": "alias/upcare-prod-phi-encryption"
+        }
+      }
+    },
+    {
+      "Sid": "DenyDestructiveActions",
+      "Effect": "Deny",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:PutBucketPolicy",
+        "s3:PutBucketAcl",
+        "iam:*",
+        "cloudtrail:Delete*",
+        "cloudtrail:Stop*",
+        "guardduty:Delete*",
+        "macie2:Disable*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

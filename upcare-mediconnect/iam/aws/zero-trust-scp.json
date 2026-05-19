@@ -1,0 +1,86 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyNonEncryptedS3Uploads",
+      "Effect": "Deny",
+      "Action": ["s3:PutObject"],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "aws:kms"
+        }
+      }
+    },
+    {
+      "Sid": "DenyHTTPRequests",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyNonAllowedRegions",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:*", "organizations:*", "support:*",
+        "sts:*", "cloudfront:*", "route53:*", "waf:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": ["us-east-1", "us-west-2"]
+        }
+      }
+    },
+    {
+      "Sid": "DenyCloudTrailDisable",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:StopLogging",
+        "cloudtrail:UpdateTrail"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyGuardDutyDisable",
+      "Effect": "Deny",
+      "Action": [
+        "guardduty:DeleteDetector",
+        "guardduty:DisassociateFromMasterAccount",
+        "guardduty:StopMonitoringMembers"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyPublicS3",
+      "Effect": "Deny",
+      "Action": [
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutAccountPublicAccessBlock"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "s3:PublicAccessBlockConfiguration/BlockPublicAcls": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyKMSKeyDeletionWithoutMFA",
+      "Effect": "Deny",
+      "Action": ["kms:ScheduleKeyDeletion", "kms:DeleteImportedKeyMaterial"],
+      "Resource": "*",
+      "Condition": {
+        "BoolIfExists": {
+          "aws:MultiFactorAuthPresent": "false"
+        }
+      }
+    }
+  ]
+}
