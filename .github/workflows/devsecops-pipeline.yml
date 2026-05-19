@@ -224,7 +224,7 @@ jobs:
     name: 🐳 Container Security Scan
     runs-on: ubuntu-latest
     needs: secret-detection
-    if: hashFiles('**/Dockerfile') != ''
+    if: always()
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
