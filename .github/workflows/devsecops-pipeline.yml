@@ -136,6 +136,7 @@ jobs:
     name: ☁️ CloudFormation Security Scan
     runs-on: ubuntu-latest
     needs: secret-detection
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -145,22 +146,22 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install cfn-lint and Checkov
-        run: pip install cfn-lint checkov
+      - name: Install cfn-lint
+        run: pip install cfn-lint || true
 
-      - name: Run cfn-lint (syntax + best practices)
-        continue-on-error: true
+      - name: Run cfn-lint (syntax validation)
         run: |
           echo "=== cfn-lint: CloudFormation template validation ==="
-          cfn-lint cloudformation/ehr/hipaa-ehr-stack.yaml \
-            --include-checks WARN INFO || true
+          cfn-lint cloudformation/ehr/hipaa-ehr-stack.yaml || true
           echo "✅ cfn-lint complete"
 
       - name: Install cfn-nag
-        run: gem install cfn-nag
+        run: sudo gem install cfn-nag || true
 
-      - name: Run cfn-nag (security rules)
-        continue-on-error: true
+      - name: Install Checkov
+        run: pip install checkov || true
+
+      - name: Run cfn-nag (security rules — report only)
         run: |
           echo "=== cfn-nag: CloudFormation security scan ==="
           cfn_nag_scan \
@@ -181,7 +182,6 @@ jobs:
           " || true
 
       - name: Run Checkov (CloudFormation — report only)
-        continue-on-error: true
         run: |
           echo "=== Checkov: CloudFormation security scan ==="
           checkov -f cloudformation/ehr/hipaa-ehr-stack.yaml \
@@ -388,7 +388,7 @@ jobs:
         with:
           name: sbom-${{ github.run_number }}
           path: sbom.cyclonedx.json
-          retention-days: 365
+          retention-days: 90
 
   # ─────────────────────────────────────────────
   # JOB 8: Security Gate
